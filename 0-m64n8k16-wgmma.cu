@@ -23,15 +23,95 @@ __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
 
     // <--- your code here --->
 
-} 
+    constexpr int core_matrix_cols_bytes = 16;
+    constexpr int core_matrix_rows = 8;
+
+    constexpr int core_matrix_cols = core_matrix_cols_bytes / sizeof(bf16);
+    constexpr int core_matrix_tot = core_matrix_cols * core_matrix_rows;
+
+    __shared__ bf16 __align__(128) a_shm[TILE_M * TILE_K];
+    __shared__ bf16 __align__(128) b_shm[TILE_N * TILE_K];
+
+    constexpr int CORE_M = TILE_M / core_matrix_rows;
+    constexpr int CORE_K = TILE_K / core_matrix_cols;
+
+    for (int m_out = 0; m_out * core_matrix_rows < TILE_M; m_out++) {
+        for (int k_out = 0; k_out * core_matrix_cols < TILE_K; k_out++) {
+            for (int m_in = 0; m_in < core_matrix_rows; ++m_in) {
+                for (int k_in = 0; k_in < core_matrix_cols; ++k_in) {
+
+                    int global_idx = (m_out * core_matrix_rows + m_in) * TILE_K +
+                        (k_out * core_matrix_cols + k_in);
+                    int shared_idx = (m_out * CORE_K + k_out) * core_matrix_tot +
+                        m_in * core_matrix_cols + k_in;
+
+                    a_shm[shared_idx] = a[global_idx];
+                }
+            }
+        }
+    }
+
+    for (int n_out = 0; n_out * core_matrix_rows < TILE_N; n_out++) {
+        for (int k_out = 0; k_out * core_matrix_cols < TILE_K; k_out++) {
+            for (int n_in = 0; n_in < core_matrix_rows; ++n_in) {
+                for (int k_in = 0; k_in < core_matrix_cols; ++k_in) {
+
+                    int global_idx = (n_out * core_matrix_rows + n_in) * TILE_K +
+                        (k_out * core_matrix_cols + k_in);
+                    int shared_idx = (n_out * CORE_K + k_out) * core_matrix_tot +
+                        n_in * core_matrix_cols + k_in;
+
+                    b_shm[shared_idx] = b[global_idx];
+                }
+            }
+        }
+    }
+
+    uint64_t a_des = make_smem_desc<NO_SWIZZLE>(
+        a_shm,
+        core_matrix_tot * sizeof(bf16),
+        core_matrix_tot * CORE_K * sizeof(bf16));
+    uint64_t b_des = make_smem_desc<NO_SWIZZLE>(
+        b_shm,
+        core_matrix_tot * sizeof(bf16),
+        core_matrix_tot * CORE_K * sizeof(bf16));
+
+    float d[4];
+
+    async_proxy_fence();
+    warpgroup_arrive();
+    wgmma_n8<0, 1, 1, 0, 0>(a_des, b_des, d);
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+
+    int m0 = 16 * warp + (lane / 4);
+    int n0 = 2 * (lane % 4);
+
+    int m1 = 16 * warp + (lane / 4);
+    int n1 = 2 * (lane % 4) + 1;
+
+    int m2 = 16 * warp + 8 + (lane / 4);
+    int n2 = 2 * (lane % 4);
+
+    int m3 = 16 * warp + 8 + (lane / 4);
+    int n3 = 2 * (lane % 4) + 1;
+
+    c[n0 * TILE_M + m0] = d[0];
+    c[n1 * TILE_M + m1] = d[1];
+    c[n2 * TILE_M + m2] = d[2];
+    c[n3 * TILE_M + m3] = d[3];
+}
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
-    
+
     // <--- your code here --->
 
+    wgmma_m64n8k16<TILE_M, TILE_N, TILE_K><<<1, 4 * 32>>>(a, b, c);
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
