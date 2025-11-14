@@ -50,7 +50,7 @@ int main() {
     }
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < K; j++) {
-            b[j * N + i] = (i + j) / 10.0f;
+            b[i * K + j] = (i + j) / 10.0f;
         }
     }
 
