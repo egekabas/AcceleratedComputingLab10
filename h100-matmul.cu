@@ -16,10 +16,23 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
-#define UNROLLED_FOR(x) _Pragma("unroll") for(x)
+#define UNROLLED_FOR(x) _Pragma("unroll") for (x)
 
 template <typename T> constexpr __host__ __device__ T ceil_div(T a, T b) {
     return (a + b - 1) / b;
+}
+
+constexpr __host__ __device__ CUtensorMapSwizzle
+convert_swizzle_enums(wgmmaSwizzle swizzle) {
+    if (swizzle == NO_SWIZZLE) {
+        return CU_TENSOR_MAP_SWIZZLE_NONE;
+    } else if (swizzle == SWIZZLE_32B) {
+        return CU_TENSOR_MAP_SWIZZLE_32B;
+    } else if (swizzle == SWIZZLE_64B) {
+        return CU_TENSOR_MAP_SWIZZLE_64B;
+    } else if (swizzle == SWIZZLE_128B) {
+        return CU_TENSOR_MAP_SWIZZLE_128B;
+    }
 }
 
 struct KernelTraits {
@@ -50,8 +63,9 @@ struct KernelTraits {
 
     static constexpr int PHASE_CNT = 2;
 
-    static constexpr int SHMEM_NEEDED =
-        PHASE_CNT * (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
+    static constexpr int BYTES_LOADED_PER_PHASE =
+        (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
+    static constexpr int SHMEM_NEEDED = PHASE_CNT * BYTES_LOADED_PER_PHASE;
 };
 
 template <typename KernelTraits>
@@ -71,9 +85,49 @@ __device__ void tma_into_shmem(
 }
 
 template <typename KernelTraits>
-__device__ void wgmma() {}
+__device__ void wgmma(int warp_group, bf16 *shmem_a, bf16 *shmem_b, float d[16][8]) {
 
-template <typename KernelTraits> __global__ void h100_matmul() {
+    shmem_a += KernelTraits::PHASE_K * warp_group * KernelTraits::WGMMA_M;
+
+    async_proxy_fence();
+    warpgroup_arrive();
+
+    for (int k = 0; k < KernelTraits::PHASE_K; k += KernelTraits::WGMMA_K) {
+
+        int stride_byte_offset =
+            KernelTraits::PHASE_K * KernelTraits::CORE_MATRIX_ROWS * sizeof(bf16);
+        uint64_t a_des = make_smem_desc<KernelTraits::SWIZZLE_TYPE>(
+            shmem_a + k,
+            1,
+            stride_byte_offset);
+        uint64_t b_des = make_smem_desc<KernelTraits::SWIZZLE_TYPE>(
+            shmem_b + k,
+            1,
+            stride_byte_offset);
+
+        wgmma_n8<1, 1, 1, 0, 0>(a_des, b_des, d);
+    }
+
+    wgmma_commit();
+}
+
+template <typename KernelTraits>
+__global__ void h100_matmul(
+    int M,
+    int N,
+    int K,
+    __grid_constant__ const CUtensorMap a_map,
+    __grid_constant__ const CUtensorMap b_map,
+    __grid_constant__ const CUtensorMap c_map) {
+
+    int block_cnt_m = ceil_div(M, KernelTraits::PHASE_M);
+    int block_cnt_n = ceil_div(N, KernelTraits::PHASE_N);
+
+    int block_m = blockIdx.x % block_cnt_m;
+    int block_n = blockIdx.x / block_cnt_m;
+
+    int m_beg = block_m * KernelTraits::PHASE_M;
+    int n_beg = block_n * KernelTraits::PHASE_N;
 
     int lane = threadIdx.x % 32;
     int raw_warp_idx = threadIdx.x / 32;
@@ -83,11 +137,106 @@ template <typename KernelTraits> __global__ void h100_matmul() {
     bool is_tma = !is_wgmma;
 
     alignas(128) extern __shared__ bf16 shmem[];
+
+    bf16 *shmem_a[2], *shmem_b[2];
+
+    shmem_a[0] = shmem;
+    shmem_b[0] = shmem_a[0] + KernelTraits::PHASE_M * KernelTraits::PHASE_K;
+    shmem_a[1] = shmem_b[0] + KernelTraits::PHASE_N * KernelTraits::PHASE_K;
+    shmem_b[1] = shmem_a[1] + KernelTraits::PHASE_M * KernelTraits::PHASE_K;
+
+    int phase_bit = 0;
+
+    // Init barrier
+    __shared__ alignas(8) uint64_t barrier;
+    if (threadIdx.x == 0) {
+        init_barrier(&barrier, 1);
+        expect_bytes_and_arrive(&barrier, KernelTraits::BYTES_LOADED_PER_PHASE);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    float d[16][8];
+
+    for (int k_beg = 0; k_beg < K; k_beg += KernelTraits::PHASE_K) {
+        if (is_tma) {
+            // TODO: Wait for wgmma from prev iteration to finish
+            // TODO: Load next phase
+
+        } else if (is_wgmma) {
+            wait(&barrier, phase_bit);
+            if (threadIdx.x == 0) {
+                expect_bytes_and_arrive(&barrier, KernelTraits::BYTES_LOADED_PER_PHASE);
+            }
+
+            wgmma(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
+        }
+
+        phase_bit ^= 1;
+    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
-    // <--- your code here --->
+    int block_cnt_m = ceil_div(M, KernelTraits::PHASE_M);
+    int block_cnt_n = ceil_div(N, KernelTraits::PHASE_N);
+    int block_cnt = block_cnt_m * block_cnt_n;
+
+    CUtensorMap a_map;
+    const uint64_t a_globalDim[] = {K, M};
+    const uint64_t a_globalStrides[] = {K * sizeof(bf16)};
+    const uint32_t a_boxDim[] = {
+        KernelTraits::CORE_MATRIX_COLS,
+        KernelTraits::CORE_MATRIX_ROWS};
+    const uint32_t a_elementStrides[] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &a_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        A,
+        a_globalDim,
+        a_globalStrides,
+        a_boxDim,
+        a_elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        convert_swizzle_enums(KernelTraits::SWIZZLE_TYPE),
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUtensorMap b_map;
+    const uint64_t b_globalDim[] = {K, N};
+    const uint64_t b_globalStrides[] = {K * sizeof(bf16)};
+    const uint32_t b_boxDim[] = {
+        KernelTraits::CORE_MATRIX_COLS,
+        KernelTraits::CORE_MATRIX_ROWS};
+    const uint32_t b_elementStrides[] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &b_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        B,
+        b_globalDim,
+        b_globalStrides,
+        b_boxDim,
+        b_elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        convert_swizzle_enums(KernelTraits::SWIZZLE_TYPE),
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUtensorMap c_map;
+    // TODO, INITIALIZE C
+
+    h100_matmul<KernelTraits>
+        <<<block_cnt, KernelTraits::TOTAL_THREAD_CNT, KernelTraits::SHMEM_NEEDED>>>(
+            M,
+            N,
+            K,
+            a_map,
+            b_map,
+            c_map);
 }
 
 /// <--- your code here --->
