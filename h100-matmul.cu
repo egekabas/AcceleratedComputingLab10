@@ -38,6 +38,8 @@ convert_swizzle_enums(wgmmaSwizzle swizzle) {
 struct KernelTraits {
 
     static constexpr int WGMMA_WARP_GROUP_CNT = 3;
+    static constexpr int WGMMA_THREAD_CNT = WGMMA_WARP_GROUP_CNT * 4 * 32;
+
     static constexpr int TMA_LOAD_WARP_CNT = 4;
     static constexpr int TMA_LOAD_THREAD_CNT = TMA_LOAD_WARP_CNT * 32;
 
@@ -72,6 +74,7 @@ template <typename KernelTraits>
 __device__ void tma_into_shmem(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
+    uint64_t *barrier,
     int lane_idx,
     bf16 *shmem_a,
     bf16 *shmem_b,
@@ -82,6 +85,19 @@ __device__ void tma_into_shmem(
     int m_end = m_beg + KernelTraits::PHASE_M;
     int n_end = n_beg + KernelTraits::PHASE_N;
     int k_end = k_beg + KernelTraits::PHASE_K;
+
+    for (int m = m_beg + lane_idx * KernelTraits::CORE_MATRIX_ROWS; m < m_end; m += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
+        cp_async_bulk_tensor_2d_global_to_shared(
+            shmem_a + (m - m_beg) * KernelTraits::CORE_MATRIX_COLS, a_map, m, k_beg, barrier
+        );
+    }
+
+    for (int n = n_beg + lane_idx * KernelTraits::CORE_MATRIX_ROWS; n < n_end; n += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
+        cp_async_bulk_tensor_2d_global_to_shared(
+            shmem_b + (n - n_beg) * KernelTraits::CORE_MATRIX_COLS, b_map, n, k_beg, barrier
+        );
+    }
+
 }
 
 template <typename KernelTraits>
@@ -160,8 +176,13 @@ __global__ void h100_matmul(
 
     for (int k_beg = 0; k_beg < K; k_beg += KernelTraits::PHASE_K) {
         if (is_tma) {
-            // TODO: Wait for wgmma from prev iteration to finish
-            // TODO: Load next phase
+            wgmma_wait<1>();
+
+            int tma_lane_idx = threadIdx.x - KernelTraits::WGMMA_THREAD_CNT;
+            tma_into_shmem(
+                a_map, b_map, &barrier, tma_lane_idx, shmem_a[phase_bit], shmem_b[phase_bit],
+                m_beg, n_beg, k_beg
+            );
 
         } else if (is_wgmma) {
             wait(&barrier, phase_bit);
@@ -174,6 +195,9 @@ __global__ void h100_matmul(
 
         phase_bit ^= 1;
     }
+
+
+    // TODO: WRITE_BACK from d[16][8] to C
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
