@@ -75,7 +75,7 @@ __device__ void tma_into_shmem(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
     uint64_t *barrier,
-    int lane_idx,
+    int tidx,
     bf16 *shmem_a,
     bf16 *shmem_b,
     int m_beg,
@@ -86,13 +86,13 @@ __device__ void tma_into_shmem(
     int n_end = n_beg + KernelTraits::PHASE_N;
     int k_end = k_beg + KernelTraits::PHASE_K;
 
-    for (int m = m_beg + lane_idx * KernelTraits::CORE_MATRIX_ROWS; m < m_end; m += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
+    for (int m = m_beg + tidx * KernelTraits::CORE_MATRIX_ROWS; m < m_end; m += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
         cp_async_bulk_tensor_2d_global_to_shared(
             shmem_a + (m - m_beg) * KernelTraits::CORE_MATRIX_COLS, a_map, m, k_beg, barrier
         );
     }
 
-    for (int n = n_beg + lane_idx * KernelTraits::CORE_MATRIX_ROWS; n < n_end; n += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
+    for (int n = n_beg + tidx * KernelTraits::CORE_MATRIX_ROWS; n < n_end; n += KernelTraits::TMA_LOAD_THREAD_CNT * KernelTraits::CORE_MATRIX_ROWS) {
         cp_async_bulk_tensor_2d_global_to_shared(
             shmem_b + (n - n_beg) * KernelTraits::CORE_MATRIX_COLS, b_map, n, k_beg, barrier
         );
@@ -139,8 +139,8 @@ __global__ void h100_matmul(
     int block_cnt_m = ceil_div(M, KernelTraits::PHASE_M);
     int block_cnt_n = ceil_div(N, KernelTraits::PHASE_N);
 
-    int block_m = blockIdx.x % block_cnt_m;
-    int block_n = blockIdx.x / block_cnt_m;
+    int block_m = blockIdx.x;
+    int block_n = blockIdx.y;
 
     int m_beg = block_m * KernelTraits::PHASE_M;
     int n_beg = block_n * KernelTraits::PHASE_N;
@@ -203,11 +203,6 @@ __global__ void h100_matmul(
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-
-    int block_cnt_m = ceil_div(M, KernelTraits::PHASE_M);
-    int block_cnt_n = ceil_div(N, KernelTraits::PHASE_N);
-    int block_cnt = block_cnt_m * block_cnt_n;
-
     CUtensorMap a_map;
     const uint64_t a_globalDim[] = {K, M};
     const uint64_t a_globalStrides[] = {K * sizeof(bf16)};
@@ -253,16 +248,34 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     CUtensorMap c_map;
-    // TODO, INITIALIZE C
+    const uint64_t c_globalDim[] = {N, M};
+    const uint64_t c_globalStrides[] = {N * sizeof(bf16)};
+    const uint32_t c_boxDim[] = {
+        KernelTraits::CORE_MATRIX_ROWS,
+        KernelTraits::CORE_MATRIX_ROWS};
+    const uint32_t c_elementStrides[] = {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &c_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        C,
+        c_globalDim,
+        c_globalStrides,
+        c_boxDim,
+        c_elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        convert_swizzle_enums(KernelTraits::SWIZZLE_TYPE),
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    int block_cnt_m = ceil_div(M, KernelTraits::PHASE_M);
+    int block_cnt_n = ceil_div(N, KernelTraits::PHASE_N);
+    dim3 grid(block_cnt_m, block_cnt_n);
 
     h100_matmul<KernelTraits>
-        <<<block_cnt, KernelTraits::TOTAL_THREAD_CNT, KernelTraits::SHMEM_NEEDED>>>(
-            M,
-            N,
-            K,
-            a_map,
-            b_map,
-            c_map);
+        <<<grid, KernelTraits::TOTAL_THREAD_CNT, KernelTraits::SHMEM_NEEDED>>>(
+            M, N, K, a_map, b_map, c_map);
 }
 
 /// <--- your code here --->
@@ -310,26 +323,10 @@ void runCublasRef(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
     float alpha = 1, beta = 0;
-    cublasStatus_t status = cublasGemmEx(
-        cublas_handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        M,
-        N,
-        K,
-        &alpha,
-        A,
-        CUDA_R_16BF,
-        K,
-        B,
-        CUDA_R_16BF,
-        N,
-        &beta,
-        C,
-        CUDA_R_16BF,
-        M,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t status =
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha,
+                     A, CUDA_R_16BF, K, B, CUDA_R_16BF, K, &beta, C,
+                     CUDA_R_16BF, M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
         std::cout << "CUBLAS error: " << status << std::endl;
