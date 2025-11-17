@@ -145,11 +145,12 @@ __global__ void h100_matmul(
     int m_beg = block_m * KernelTraits::PHASE_M;
     int n_beg = block_n * KernelTraits::PHASE_N;
 
-    int lane = threadIdx.x % 32;
-    int raw_warp_idx = threadIdx.x / 32;
-    int warp_group = raw_warp_idx / 4;
+    int tidx = threadIdx.x;
+    int lidx = tidx % 32;
+    int widx = tidx / 32;
+    int gidx = widx / 4;
 
-    bool is_wgmma = warp_group <= KernelTraits::WGMMA_WARP_GROUP_CNT;
+    bool is_wgmma = gidx <= KernelTraits::WGMMA_WARP_GROUP_CNT;
     bool is_tma = !is_wgmma;
 
     alignas(128) extern __shared__ bf16 shmem[];
@@ -165,7 +166,7 @@ __global__ void h100_matmul(
 
     // Init barrier
     __shared__ alignas(8) uint64_t barrier;
-    if (threadIdx.x == 0) {
+    if (tidx == 0) {
         init_barrier(&barrier, 1);
         expect_bytes_and_arrive(&barrier, KernelTraits::BYTES_LOADED_PER_PHASE);
     }
@@ -178,15 +179,16 @@ __global__ void h100_matmul(
         if (is_tma) {
             wgmma_wait<1>();
 
-            int tma_lane_idx = threadIdx.x - KernelTraits::WGMMA_THREAD_CNT;
+            int tma_tidx = tidx - KernelTraits::WGMMA_THREAD_CNT;
             tma_into_shmem(
-                a_map, b_map, &barrier, tma_lane_idx, shmem_a[phase_bit], shmem_b[phase_bit],
+                a_map, b_map, &barrier, tma_tidx, 
+                shmem_a[phase_bit], shmem_b[phase_bit],
                 m_beg, n_beg, k_beg
             );
 
         } else if (is_wgmma) {
             wait(&barrier, phase_bit);
-            if (threadIdx.x == 0) {
+            if (tidx == 0) {
                 expect_bytes_and_arrive(&barrier, KernelTraits::BYTES_LOADED_PER_PHASE);
             }
 
