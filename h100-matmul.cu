@@ -17,6 +17,7 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 
 #define UNROLLED_FOR(x) _Pragma("unroll") for (x)
+#define max(x, y) (((x) > (y)) ? (x) : (y))
 
 template <typename T> constexpr __host__ __device__ T ceil_div(T a, T b) {
     return (a + b - 1) / b;
@@ -37,11 +38,10 @@ convert_swizzle_enums(wgmmaSwizzle swizzle) {
 
 struct KernelTraits {
 
-    static constexpr int WGMMA_WARP_GROUP_CNT = 3;
+    static constexpr int WGMMA_WARP_GROUP_CNT = 2;
     static constexpr int WGMMA_THREAD_CNT = WGMMA_WARP_GROUP_CNT * 4 * 32;
 
     static constexpr int TMA_LOAD_WARP_CNT = 4;
-    static constexpr int TMA_LOAD_THREAD_CNT = TMA_LOAD_WARP_CNT * 32;
 
     static constexpr int TOTAL_WARP_CNT = 4 * WGMMA_WARP_GROUP_CNT + TMA_LOAD_WARP_CNT;
     static constexpr int TOTAL_THREAD_CNT = 32 * TOTAL_WARP_CNT;
@@ -50,62 +50,40 @@ struct KernelTraits {
     static constexpr int WGMMA_N = 256;
     static constexpr int WGMMA_K = 16;
 
-    static constexpr wgmmaSwizzle SWIZZLE_TYPE = SWIZZLE_64B;
+    static constexpr wgmmaSwizzle SWIZZLE_TYPE = SWIZZLE_128B;
 
     // depends on swizzle
     static constexpr int CORE_MATRIX_ROWS = 8;
-    static constexpr int CORE_MATRIX_COLS_BYTES = 64;
+    static constexpr int CORE_MATRIX_COLS_BYTES = 128;
     static constexpr int CORE_MATRIX_COLS = CORE_MATRIX_COLS_BYTES / sizeof(bf16);
-    static constexpr int CORE_MATRIX_N_ELEMENTS = CORE_MATRIX_ROWS * CORE_MATRIX_COLS;
 
     static constexpr int PHASE_M = WGMMA_M * WGMMA_WARP_GROUP_CNT;
     static constexpr int PHASE_N = WGMMA_N;
     static constexpr int PHASE_K = CORE_MATRIX_COLS;
 
-    static constexpr int WGMMAS_PER_PHASE_PER_WARPGROUP = PHASE_K / WGMMA_K;
-
     static constexpr int PHASE_CNT = 2;
 
     static constexpr int BYTES_LOADED_PER_PHASE =
         (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
-    static constexpr int SMEM_SIZE = PHASE_CNT * BYTES_LOADED_PER_PHASE;
+    static constexpr int C_SMEM_SIZE = PHASE_M * PHASE_N * sizeof(bf16);
+    static constexpr int SMEM_SIZE = max(PHASE_CNT * BYTES_LOADED_PER_PHASE, C_SMEM_SIZE);
     
 };
 
-// We use define instead of function definition since __grid_constant__ variables can only be passed to __global__ functions.
-#define TMA_LOAD(a_map, b_map, barrier, tidx, sa, sb, m_beg, n_beg, k_beg)                                              \
-do {                                                                                                                    \
-    int m_end = m_beg + KT::PHASE_M;                                                                                    \
-    int n_end = n_beg + KT::PHASE_N;                                                                                    \
-    int k_end = k_beg + KT::PHASE_K;                                                                                    \
-    for (int m = m_beg + tidx * KT::CORE_MATRIX_ROWS; m < m_end; m += KT::TMA_LOAD_THREAD_CNT * KT::CORE_MATRIX_ROWS) { \
-        cp_async_bulk_tensor_2d_global_to_shared(                                                                       \
-            sa + (m - m_beg) * KT::CORE_MATRIX_COLS, &a_map, m, k_beg, barrier                                          \
-        );                                                                                                              \
-    }                                                                                                                   \
-    for (int n = n_beg + tidx * KT::CORE_MATRIX_ROWS; n < n_end; n += KT::TMA_LOAD_THREAD_CNT * KT::CORE_MATRIX_ROWS) { \
-        cp_async_bulk_tensor_2d_global_to_shared(                                                                       \
-            sb + (n - n_beg) * KT::CORE_MATRIX_COLS, &b_map, n, k_beg, barrier                                          \
-        );                                                                                                              \
-    }                                                                                                                   \
-} while (0);
-
 template <typename KT>
 __device__ void wgmma(int gidx, bf16 *sa, bf16 *sb, float d[16][8]) {
-
     sa += KT::PHASE_K * gidx * KT::WGMMA_M;
-
-    async_proxy_fence();
     warpgroup_arrive();
 
-    for (int k = 0; k < KT::PHASE_K; k += KT::WGMMA_K) {
-        int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
+    int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
+    UNROLLED_FOR (int k = 0; k < KT::PHASE_K; k += KT::WGMMA_K) {
         uint64_t a_des = make_smem_desc<KT::SWIZZLE_TYPE>(sa + k, 1, stride_byte_offset);
         uint64_t b_des = make_smem_desc<KT::SWIZZLE_TYPE>(sb + k, 1, stride_byte_offset);
         wgmma_n256<1, 1, 1, 0, 0>(a_des, b_des, d);
     }
 
     wgmma_commit();
+    wgmma_wait<0>();
 }
 
 template <typename KT>
@@ -127,87 +105,75 @@ __global__ void h100_matmul(
     int widx = (tidx / 32) % 4; // Warp id within the warp gorup
     int gidx = (tidx / 32) / 4; // Warp group id
 
-    bool is_wgmma = gidx <= KT::WGMMA_WARP_GROUP_CNT;
+    bool is_wgmma = gidx < KT::WGMMA_WARP_GROUP_CNT;
     bool is_tma = !is_wgmma;
 
     alignas(128) extern __shared__ bf16 _smem[];
 
-    bf16 *sa[2], *sb[2], *sc = _smem;
-
+    bf16 *sa[KT::PHASE_CNT], *sb[KT::PHASE_CNT], *sc = _smem;
     sa[0] = _smem;
-    sb[0] = sa[0] + KT::PHASE_M * KT::PHASE_K;
-    sa[1] = sb[0] + KT::PHASE_N * KT::PHASE_K;
-    sb[1] = sa[1] + KT::PHASE_M * KT::PHASE_K;
-
-    int phase_bit = 0;
+    sb[0] = sa[0] + KT::PHASE_CNT * KT::PHASE_M * KT::PHASE_K;
+    UNROLLED_FOR (int i = 1; i < KT::PHASE_CNT; i++) {
+        sa[i] = sa[i - 1] + KT::PHASE_M * KT::PHASE_K;
+        sb[i] = sb[i - 1] + KT::PHASE_N * KT::PHASE_K;
+    }
+    
+    int qidx = 0, phase_bit = 0;
 
     // Init barrier
-    __shared__ alignas(8) uint64_t barrier;
+    __shared__ alignas(8) uint64_t full[KT::PHASE_CNT], empty[KT::PHASE_CNT];
     if (tidx == 0) {
-        init_barrier(&barrier, 1);
-        expect_bytes_and_arrive(&barrier, KT::BYTES_LOADED_PER_PHASE);
+        for (int i = 0; i < KT::PHASE_CNT; i++) {
+            init_barrier(&full[i], 1);
+            init_barrier(&empty[i], KT::WGMMA_WARP_GROUP_CNT);
+            arrive(&empty[i], KT::WGMMA_WARP_GROUP_CNT);
+        }
     }
-    async_proxy_fence();
     __syncthreads();
 
-    float d[16][8] = {0.0f};
+    #define MODULO_QIDX if (qidx == KT::PHASE_CNT) {qidx = 0; phase_bit ^= 1;}
+
+    if (is_tma) {
+        if (tidx == KT::WGMMA_THREAD_CNT) { // Thread 0 for the producer
+            for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, qidx++) {
+                MODULO_QIDX;
+                
+                wait(&empty[qidx], phase_bit);
+                expect_bytes_and_arrive(&full[qidx], KT::BYTES_LOADED_PER_PHASE);
     
-    for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-        if (is_tma) {
-            wgmma_wait<1>();
-            
-            int tma_tidx = tidx - KT::WGMMA_THREAD_CNT;
-            TMA_LOAD(
-                a_map, b_map, &barrier, tma_tidx, 
-                sa[phase_bit], sb[phase_bit],
-                m_beg, n_beg, k_beg
-            );
+                cp_async_bulk_tensor_3d_global_to_shared(sa[qidx], &a_map, 0, m_beg, k_beg / KT::CORE_MATRIX_COLS, &full[qidx]);
+                cp_async_bulk_tensor_3d_global_to_shared(sb[qidx], &b_map, 0, n_beg, k_beg / KT::CORE_MATRIX_COLS, &full[qidx]);
+            }
+        }
+    } else {
+        float d[16][8] = {0.0f};
+        for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, qidx++) {        
+            MODULO_QIDX;
+            wait(&full[qidx], phase_bit);
+        
+            wgmma<KT>(gidx, sa[qidx], sb[qidx], d);
+            wgmma_wait<0>();
+            if (lidx == 0 && widx == 0) // One thread per warp group
+                arrive(&empty[qidx], 1);
         }
 
-        if (is_wgmma) {
-            wait(&barrier, phase_bit);
-            if (tidx == 0) {
-                expect_bytes_and_arrive(&barrier, KT::BYTES_LOADED_PER_PHASE);
-            }
-    
-            wgmma<KT>(gidx, sa[phase_bit], sb[phase_bit], d);
-        }
-    
-    }
-    
-    if (is_wgmma) {
         wgmma_wait<0>();
         UNROLLED_FOR(int i = 0; i < 16; i++) {
             UNROLLED_FOR(int j = 0; j < 8; j++) {
                 int idx = i * 8 + j;
-                // Legacy: IGNORE
-                // int x = gidx * KT::WGMMA_M + widx * 16 + i + ((idx & 3) ? 8 : 0);
-                // int y = (idx >> 2) * 8 + (idx & 1);
-                // sc[x * KT::PHASE_N + y] = __float2bfloat16(d[i][j]);
-
-                // This new reg->smem logic writes to sc in core matrix blocks
-                int sidx = (gidx * KT::WGMMA_M + widx * 16) * KT::WGMMA_N;
-                sidx += (idx & 3) ? KT::CORE_MATRIX_ROWS * KT::WGMMA_N : 0;
-                sidx += (idx >> 2) * KT::CORE_MATRIX_N_ELEMENTS;
-                sidx += lidx * 2 + (idx & 1);
-                sc[sidx] = __float2bfloat16(d[i][j]);
+                int x = gidx * KT::WGMMA_M + widx * 16 + ((idx & 2) ? 8 : 0) + (lidx >> 2);
+                int y = (idx >> 2) * 8 + (idx & 1) + (lidx & 3) * 2;
+                sc[y * KT::PHASE_M + x] = __float2bfloat16(d[i][j]);
             }
         }
-    }
-    __syncthreads();
-    if (is_wgmma)
-        return;
 
-    int m_end = m_beg + KT::PHASE_M;
-    int n_end = n_beg + KT::PHASE_N;
-    for (int m = m_beg + tidx * KT::CORE_MATRIX_ROWS; m < m_end; m += KT::TMA_LOAD_THREAD_CNT * KT::CORE_MATRIX_ROWS) {
-        for (int n = n_beg + tidx * KT::CORE_MATRIX_ROWS; n < n_end; n += KT::TMA_LOAD_THREAD_CNT * KT::CORE_MATRIX_COLS) {
-            bf16 *core_matrix = sc + ((m - m_beg) * (KT::WGMMA_N / KT::CORE_MATRIX_COLS) + (n - n_beg)) * KT::CORE_MATRIX_N_ELEMENTS;
-            cp_async_bulk_tensor_2d_shared_to_global(&c_map, m, n, core_matrix);
+        asm volatile("bar.sync 10, 256;\n");
+        if (tidx == 0) {
+            cp_async_bulk_tensor_2d_shared_to_global(&c_map, m_beg, n_beg, sc);
+            tma_commit_group();
+            tma_wait_until_pending<0>();
         }
     }
-    tma_commit_group();
-    tma_wait_until_pending<0>();
 }
 
 template<int block_size_x, int block_size_y>
@@ -235,12 +201,37 @@ CUtensorMap create_tensor_map(int rows, int cols, bf16* ptr, wgmmaSwizzle swizzl
     return map;
 }
 
+template <int core_matrix_cols, int block_size_x, int block_size_y>
+CUtensorMap create_tensor_map_3d(int rows, int cols, bf16* ptr, wgmmaSwizzle swizzle) {
+    CUtensorMap map;
+    const uint64_t globalDim     [] = {(uint64_t)core_matrix_cols, (uint64_t)rows, (uint64_t)cols / core_matrix_cols};
+    const uint64_t globalStrides [] = {(uint64_t)cols * sizeof(bf16), (uint64_t)core_matrix_cols * sizeof(bf16)};
+    const uint32_t boxDim        [] = {core_matrix_cols, block_size_x, block_size_y / core_matrix_cols};
+    const uint32_t elementStrides[] = {1, 1, 1};
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        3,
+        ptr,
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        convert_swizzle_enums(swizzle),
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)
+    );
+
+    return map;
+}
+
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     using KT = KernelTraits;
 
-    CUtensorMap a_map = create_tensor_map<KT::CORE_MATRIX_ROWS, KT::CORE_MATRIX_COLS>(M, K, A, KT::SWIZZLE_TYPE);
-    CUtensorMap b_map = create_tensor_map<KT::CORE_MATRIX_ROWS, KT::CORE_MATRIX_COLS>(N, K, B, KT::SWIZZLE_TYPE);
-    CUtensorMap c_map = create_tensor_map<KT::CORE_MATRIX_ROWS, KT::CORE_MATRIX_COLS>(M, N, C, NO_SWIZZLE);
+    CUtensorMap a_map = create_tensor_map_3d<KT::CORE_MATRIX_COLS, KT::PHASE_M, KT::PHASE_K>(M, K, A, KT::SWIZZLE_TYPE);
+    CUtensorMap b_map = create_tensor_map_3d<KT::CORE_MATRIX_COLS, KT::PHASE_N, KT::PHASE_K>(N, K, B, KT::SWIZZLE_TYPE);
+    CUtensorMap c_map = create_tensor_map<KT::PHASE_N, KT::PHASE_M>(N, M, C, NO_SWIZZLE);
     
     int block_cnt_m = ceil_div(M, KT::PHASE_M);
     int block_cnt_n = ceil_div(N, KT::PHASE_N);
@@ -255,6 +246,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     );
 
     h100_matmul<KT><<<grid, KT::TOTAL_THREAD_CNT, KT::SMEM_SIZE>>>(M, N, K, a_map, b_map, c_map);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 /// <--- your code here --->
