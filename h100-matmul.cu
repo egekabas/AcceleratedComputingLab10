@@ -9,6 +9,7 @@
 #include <iostream>
 #include <random>
 #include <vector>
+#include <cassert>
 
 typedef __nv_bfloat16 bf16;
 
@@ -33,49 +34,58 @@ convert_swizzle_enums(wgmmaSwizzle swizzle) {
         return CU_TENSOR_MAP_SWIZZLE_64B;
     } else if (swizzle == SWIZZLE_128B) {
         return CU_TENSOR_MAP_SWIZZLE_128B;
-    }
+    } assert(false);
 }
 
+constexpr __host__ __device__ wgmmaSwizzle 
+get_wgmma_swizzle(int swizzle_nbytes) {
+    if (swizzle_nbytes == 16) {
+        return NO_SWIZZLE;
+    } else if (swizzle_nbytes == 32) {
+        return SWIZZLE_32B;
+    } else if (swizzle_nbytes == 64) {
+        return SWIZZLE_64B;
+    } else if (swizzle_nbytes == 128) {
+        return SWIZZLE_128B;
+    } assert(false);
+}
+
+template<int N_WGMMA_GROUPS_ = 2, int N_PHASES_ = 4, int SWIZZLE_NBYTES_ = 128>
 struct KernelTraits {
+    static constexpr int N_WGMMA_GROUPS = N_WGMMA_GROUPS_;
+    static constexpr int N_PHASES = N_PHASES_;
+    static constexpr int SWIZZLE_NBYTES = SWIZZLE_NBYTES_;
 
-    static constexpr int WGMMA_WARP_GROUP_CNT = 2;
-    static constexpr int WGMMA_THREAD_CNT = WGMMA_WARP_GROUP_CNT * 4 * 32;
-
-    static constexpr int TMA_LOAD_WARP_CNT = 4;
-
-    static constexpr int TOTAL_WARP_CNT = 4 * WGMMA_WARP_GROUP_CNT + TMA_LOAD_WARP_CNT;
-    static constexpr int TOTAL_THREAD_CNT = 32 * TOTAL_WARP_CNT;
+    static constexpr int N_WGMMA_THREADS = N_WGMMA_GROUPS * 4 * 32;
+    static constexpr int N_WARPS = 4 * N_WGMMA_GROUPS + 1; // 1 for TMA
+    static constexpr int N_THREADS = 32 * N_WARPS;
 
     static constexpr int WGMMA_M = 64;
     static constexpr int WGMMA_N = 256;
     static constexpr int WGMMA_K = 16;
+    
+    static constexpr wgmmaSwizzle SWIZZLE_TYPE = get_wgmma_swizzle(SWIZZLE_NBYTES);
 
-    static constexpr wgmmaSwizzle SWIZZLE_TYPE = SWIZZLE_128B;
-
-    // depends on swizzle
     static constexpr int CORE_MATRIX_ROWS = 8;
-    static constexpr int CORE_MATRIX_COLS_BYTES = 128;
+    static constexpr int CORE_MATRIX_COLS_BYTES = SWIZZLE_NBYTES;
     static constexpr int CORE_MATRIX_COLS = CORE_MATRIX_COLS_BYTES / sizeof(bf16);
 
-    static constexpr int PHASE_M = WGMMA_M * WGMMA_WARP_GROUP_CNT;
+    static constexpr int PHASE_M = WGMMA_M * N_WGMMA_GROUPS;
     static constexpr int PHASE_N = WGMMA_N;
     static constexpr int PHASE_K = CORE_MATRIX_COLS;
 
-    static constexpr int PHASE_CNT = 2;
-
-    static constexpr int BYTES_LOADED_PER_PHASE =
-        (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
+    static constexpr int BYTES_LOADED_PER_PHASE = (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
     static constexpr int C_SMEM_SIZE = PHASE_M * PHASE_N * sizeof(bf16);
-    static constexpr int SMEM_SIZE = max(PHASE_CNT * BYTES_LOADED_PER_PHASE, C_SMEM_SIZE);
-    
+    static constexpr int SMEM_SIZE = max(N_PHASES * BYTES_LOADED_PER_PHASE, C_SMEM_SIZE);
 };
 
-template <typename KT>
+using KT = KernelTraits<>;
+
 __device__ void wgmma(int gidx, bf16 *sa, bf16 *sb, float d[16][8]) {
     sa += KT::PHASE_K * gidx * KT::WGMMA_M;
     warpgroup_arrive();
 
-    int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
+    int stride_byte_offset = KT::CORE_MATRIX_COLS_BYTES * KT::CORE_MATRIX_ROWS;
     UNROLLED_FOR (int k = 0; k < KT::PHASE_K; k += KT::WGMMA_K) {
         uint64_t a_des = make_smem_desc<KT::SWIZZLE_TYPE>(sa + k, 1, stride_byte_offset);
         uint64_t b_des = make_smem_desc<KT::SWIZZLE_TYPE>(sb + k, 1, stride_byte_offset);
@@ -83,10 +93,8 @@ __device__ void wgmma(int gidx, bf16 *sa, bf16 *sb, float d[16][8]) {
     }
 
     wgmma_commit();
-    wgmma_wait<0>();
 }
 
-template <typename KT>
 __global__ void h100_matmul(
     int M,
     int N,
@@ -105,15 +113,15 @@ __global__ void h100_matmul(
     int widx = (tidx / 32) % 4; // Warp id within the warp gorup
     int gidx = (tidx / 32) / 4; // Warp group id
 
-    bool is_wgmma = gidx < KT::WGMMA_WARP_GROUP_CNT;
+    bool is_wgmma = gidx < KT::N_WGMMA_GROUPS;
     bool is_tma = !is_wgmma;
 
     alignas(128) extern __shared__ bf16 _smem[];
 
-    bf16 *sa[KT::PHASE_CNT], *sb[KT::PHASE_CNT], *sc = _smem;
+    bf16 *sa[KT::N_PHASES], *sb[KT::N_PHASES], *sc = _smem;
     sa[0] = _smem;
-    sb[0] = sa[0] + KT::PHASE_CNT * KT::PHASE_M * KT::PHASE_K;
-    UNROLLED_FOR (int i = 1; i < KT::PHASE_CNT; i++) {
+    sb[0] = sa[0] + KT::N_PHASES * KT::PHASE_M * KT::PHASE_K;
+    UNROLLED_FOR (int i = 1; i < KT::N_PHASES; i++) {
         sa[i] = sa[i - 1] + KT::PHASE_M * KT::PHASE_K;
         sb[i] = sb[i - 1] + KT::PHASE_N * KT::PHASE_K;
     }
@@ -121,20 +129,20 @@ __global__ void h100_matmul(
     int qidx = 0, phase_bit = 0;
 
     // Init barrier
-    __shared__ alignas(8) uint64_t full[KT::PHASE_CNT], empty[KT::PHASE_CNT];
+    __shared__ alignas(8) uint64_t full[KT::N_PHASES], empty[KT::N_PHASES];
     if (tidx == 0) {
-        for (int i = 0; i < KT::PHASE_CNT; i++) {
+        for (int i = 0; i < KT::N_PHASES; i++) {
             init_barrier(&full[i], 1);
-            init_barrier(&empty[i], KT::WGMMA_WARP_GROUP_CNT);
-            arrive(&empty[i], KT::WGMMA_WARP_GROUP_CNT);
+            init_barrier(&empty[i], KT::N_WGMMA_GROUPS);
+            arrive(&empty[i], KT::N_WGMMA_GROUPS);
         }
     }
     __syncthreads();
 
-    #define MODULO_QIDX if (qidx == KT::PHASE_CNT) {qidx = 0; phase_bit ^= 1;}
+    #define MODULO_QIDX if (qidx == KT::N_PHASES) {qidx = 0; phase_bit ^= 1;}
 
     if (is_tma) {
-        if (tidx == KT::WGMMA_THREAD_CNT) { // Thread 0 for the producer
+        if (tidx == KT::N_WGMMA_THREADS) { // Thread 0 for the producer
             for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, qidx++) {
                 MODULO_QIDX;
                 
@@ -151,7 +159,7 @@ __global__ void h100_matmul(
             MODULO_QIDX;
             wait(&full[qidx], phase_bit);
         
-            wgmma<KT>(gidx, sa[qidx], sb[qidx], d);
+            wgmma(gidx, sa[qidx], sb[qidx], d);
             wgmma_wait<0>();
             if (lidx == 0 && widx == 0) // One thread per warp group
                 arrive(&empty[qidx], 1);
@@ -227,8 +235,6 @@ CUtensorMap create_tensor_map_3d(int rows, int cols, bf16* ptr, wgmmaSwizzle swi
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
-    using KT = KernelTraits;
-
     CUtensorMap a_map = create_tensor_map_3d<KT::CORE_MATRIX_COLS, KT::PHASE_M, KT::PHASE_K>(M, K, A, KT::SWIZZLE_TYPE);
     CUtensorMap b_map = create_tensor_map_3d<KT::CORE_MATRIX_COLS, KT::PHASE_N, KT::PHASE_K>(N, K, B, KT::SWIZZLE_TYPE);
     CUtensorMap c_map = create_tensor_map<KT::PHASE_N, KT::PHASE_M>(N, M, C, NO_SWIZZLE);
@@ -240,12 +246,12 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     constexpr int MAX_H100_SMEM_SIZE = 227000;
     static_assert(MAX_H100_SMEM_SIZE >= KT::SMEM_SIZE);
     cudaFuncSetAttribute(
-        h100_matmul<KT>,
+        h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         KT::SMEM_SIZE
     );
 
-    h100_matmul<KT><<<grid, KT::TOTAL_THREAD_CNT, KT::SMEM_SIZE>>>(M, N, K, a_map, b_map, c_map);
+    h100_matmul<<<grid, KT::N_THREADS, KT::SMEM_SIZE>>>(M, N, K, a_map, b_map, c_map);
     CUDA_CHECK(cudaGetLastError());
 }
 
