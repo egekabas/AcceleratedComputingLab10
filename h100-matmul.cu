@@ -63,7 +63,9 @@ struct KernelTraits {
   static constexpr int CORE_MATRIX_ROWS = 8;
   static constexpr int CORE_MATRIX_COLS = get_swizzle_bytes(SWIZZLE_TYPE) / sizeof(bf16);
 
-  static constexpr int PHASE_M = WGMMA_M * WGMMA_WARP_GROUP_CNT;
+  static constexpr int CALCS_PER_WARPGROUP = 1;
+
+  static constexpr int PHASE_M = WGMMA_M * WGMMA_WARP_GROUP_CNT * CALCS_PER_WARPGROUP;
   static constexpr int PHASE_N = WGMMA_N;
   static constexpr int PHASE_K = CORE_MATRIX_COLS;
 
@@ -73,10 +75,11 @@ struct KernelTraits {
       (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
   static constexpr int SHMEM_NEEDED = PHASE_CNT * BYTES_LOADED_PER_PHASE;
 
-  static constexpr int BLOCK_CNT_M = 11;
-  static constexpr int BLOCK_CNT_N = 11;
+  static constexpr int BLOCK_CNT_M = 16;
+  static constexpr int BLOCK_CNT_N = 8;
 };
 
+__always_inline
 __device__ void tma_into_shmem(
     const CUtensorMap *a_map,
     const CUtensorMap *b_map,
@@ -92,25 +95,53 @@ __device__ void tma_into_shmem(
 }
 
 template <typename KT>
-__device__ void wgmma(int warp_group, bf16 *shmem_a, bf16 *shmem_b, float d[16][8]) {
+__always_inline
+__device__ void wgmma(int warp_group, bf16 *shmem_a, bf16 *shmem_b, float d[KT::CALCS_PER_WARPGROUP][16][8]) {
 
-  async_proxy_fence();
+  warpgroup_arrive();
 
-  UNROLLED_FOR(int k_idx = 0; k_idx < KT::PHASE_K / KT::WGMMA_K; ++k_idx) {
+  UNROLLED_FOR(int m_idx = 0; m_idx < KT::CALCS_PER_WARPGROUP; ++m_idx) {
+    UNROLLED_FOR(int k_idx = 0; k_idx < KT::PHASE_K / KT::WGMMA_K; ++k_idx) {
 
-    int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
+      int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
 
-    bf16 *cur_shmem_a = shmem_a + warp_group * KT::WGMMA_M * KT::PHASE_K + k_idx * KT::WGMMA_K;
-    bf16 *cur_shmem_b = shmem_b + k_idx * KT::WGMMA_K;
+      bf16 *cur_shmem_a = shmem_a + (warp_group * KT::CALCS_PER_WARPGROUP + m_idx) * KT::WGMMA_M * KT::PHASE_K + k_idx * KT::WGMMA_K;
+      bf16 *cur_shmem_b = shmem_b + k_idx * KT::WGMMA_K;
 
-    uint64_t a_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_a, 1, stride_byte_offset);
-    uint64_t b_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_b, 1, stride_byte_offset);
+      uint64_t a_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_a, 1, stride_byte_offset);
+      uint64_t b_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_b, 1, stride_byte_offset);
 
-    warpgroup_arrive();
-    wgmma_n256<1, 1, 1, 0, 0>(a_des, b_des, d);
+      wgmma_n256<1, 1, 1, 0, 0>(a_des, b_des, d[m_idx]);
+    }
   }
 
   wgmma_commit();
+}
+
+template <typename KT>
+__always_inline
+__device__ void write_back_to_c(
+  int M, int N, int m_beg, int n_beg, bf16 *C, int warp_group, int warp_idx, int lane_idx, float d[KT::CALCS_PER_WARPGROUP][16][8]
+) {
+
+  UNROLLED_FOR(int m_idx = 0; m_idx < KT::CALCS_PER_WARPGROUP; ++m_idx){
+    UNROLLED_FOR(int i = 0; i < 32; ++i) {
+      UNROLLED_FOR(int j = 0; j < 2; ++j) {
+        UNROLLED_FOR(int k = 0; k < 2; ++k) {
+
+          int idx = k + j * 2 + i * 2 * 2 + m_idx * 2 * 2 * 32;
+
+          int m = (m_beg + (warp_group * KT::CALCS_PER_WARPGROUP + m_idx) * KT::WGMMA_M) + 16 * warp_idx + lane_idx / 4 + j * 8;
+          int n = (n_beg) + (lane_idx % 4) * 2 + 8 * i + k;
+
+          if (n < N && m < M) {
+            C[n * N + m] = *(d[0][0] + idx);
+          }
+        }
+      }
+    }
+  }
+
 }
 
 template <typename KT>
@@ -164,11 +195,11 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
   async_proxy_fence();
   __syncthreads();
 
-  float d[16][8];
+  float d[KT::CALCS_PER_WARPGROUP][16][8];
 
   int phase_bit = 0;
 
-  if (is_tma) {
+  if (is_tma) {;
 
     for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
       for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
@@ -186,7 +217,6 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
                 n_beg,
                 k_beg);
           }
-          warpgroup_arrive();
         }
       }
     }
@@ -202,33 +232,17 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
           if (warp_idx == 0 && lane_idx == 0) {
             arrive(&wgmma_tracker, 1);
           }
-          warpgroup_arrive();
 
           wait(&tma_tracker, phase_bit);
           if (threadIdx.x == 0) {
             expect_bytes_and_arrive(&tma_tracker, KT::BYTES_LOADED_PER_PHASE);
           }
-          warpgroup_arrive();
 
           wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
           wgmma_wait<0>();
         }
 
-        UNROLLED_FOR(int i = 0; i < 32; ++i) {
-          UNROLLED_FOR(int j = 0; j < 2; ++j) {
-            UNROLLED_FOR(int k = 0; k < 2; ++k) {
-
-              int idx = k + j * 2 + i * 2 * 2;
-
-              int m = (m_beg + warp_group * KT::WGMMA_M) + 16 * warp_idx + lane_idx / 4 + j * 8;
-              int n = (n_beg) + (lane_idx % 4) * 2 + 8 * i + k;
-
-              if (n < N && m < M) {
-                C[n * N + m] = *(d[0] + idx);
-              }
-            }
-          }
-        }
+        write_back_to_c<KT>(M, N, m_beg, n_beg, C, warp_group, warp_idx, lane_idx, d);
       }
     }
   }
