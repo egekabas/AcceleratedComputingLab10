@@ -200,6 +200,7 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
 
   bool is_tma = warp_group < KT::TMA_WARP_GROUP_CNT;
   bool first_thread_in_role = is_tma ? threadIdx.x == 0 : threadIdx.x == KT::TMA_THREAD_CNT;
+  bool first_in_warpgroup = warp_idx == 0 && lane_idx == 0;
 
   alignas(128) extern __shared__ bf16 shmem[];
 
@@ -220,10 +221,10 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
     tma_tracker[0].init_(1);
     tma_tracker[1].init_(1);
 
-    wgmma_tracker[0].init_(KT::WGMMA_THREAD_CNT);
-    wgmma_tracker[0].arrive_(KT::WGMMA_THREAD_CNT);
-    wgmma_tracker[1].init_(KT::WGMMA_THREAD_CNT);
-    wgmma_tracker[1].arrive_(KT::WGMMA_THREAD_CNT);
+    wgmma_tracker[0].init_(KT::WGMMA_WARP_GROUP_CNT);
+    wgmma_tracker[0].arrive_(KT::WGMMA_WARP_GROUP_CNT);
+    wgmma_tracker[1].init_(KT::WGMMA_WARP_GROUP_CNT);
+    wgmma_tracker[1].arrive_(KT::WGMMA_WARP_GROUP_CNT);
   }
 
   async_proxy_fence();
@@ -270,7 +271,9 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
           wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
           wgmma_wait<0>();
 
-          wgmma_tracker[phase_bit].arrive_();
+          if (first_in_warpgroup) {
+            wgmma_tracker[phase_bit].arrive_();
+          }
         }
 
         write_back_to_c<KT>(M, N, m_beg, n_beg, C, warp_group, warp_idx, lane_idx, d);
