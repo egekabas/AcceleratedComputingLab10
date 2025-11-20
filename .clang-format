@@ -10,5 +10,5 @@ AllowAllConstructorInitializersOnNextLine: 'false'
 AllowAllParametersOfDeclarationOnNextLine: 'false'
 BinPackArguments: 'false'
 BinPackParameters: 'false'
-IndentWidth: 4
-ColumnLimit: 90
+IndentWidth: 2
+ColumnLimit: 100
