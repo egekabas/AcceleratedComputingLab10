@@ -160,7 +160,7 @@ public:
 
   __device__ void init_(int arrival_count) { init_barrier(barrier, arrival_count); }
 
-  __device__ void arrive_() { arrive(barrier, 1); }
+  __device__ void arrive_(int count = 1) { arrive(barrier, count); }
 
   __device__ void wait_() {
     wait(barrier, phase_bit);
@@ -210,15 +210,20 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
   shmem_a[1] = shmem_b[0] + KT::PHASE_N * KT::PHASE_K;
   shmem_b[1] = shmem_a[1] + KT::PHASE_M * KT::PHASE_K;
 
-  __shared__ alignas(8) uint64_t tma_tracker_raw;
-  __shared__ alignas(8) uint64_t wgmma_tracker_raw;
+  __shared__ alignas(8) uint64_t tma_tracker_raw[2];
+  __shared__ alignas(8) uint64_t wgmma_tracker_raw[2];
 
-  BarrierWrapper tma_tracker{&tma_tracker_raw};
-  BarrierWrapper wgmma_tracker{&wgmma_tracker_raw};
+  BarrierWrapper tma_tracker[2] = {BarrierWrapper{&tma_tracker_raw[0]}, BarrierWrapper{&tma_tracker_raw[1]}};
+  BarrierWrapper wgmma_tracker[2] = {BarrierWrapper{&wgmma_tracker_raw[0]}, BarrierWrapper{&wgmma_tracker_raw[1]}};
 
   if (threadIdx.x == 0) {
-    tma_tracker.init_(1);
-    wgmma_tracker.init_(KT::WGMMA_THREAD_CNT);
+    tma_tracker[0].init_(1);
+    tma_tracker[1].init_(1);
+
+    wgmma_tracker[0].init_(KT::WGMMA_THREAD_CNT);
+    wgmma_tracker[0].arrive_(KT::WGMMA_THREAD_CNT);
+    wgmma_tracker[1].init_(KT::WGMMA_THREAD_CNT);
+    wgmma_tracker[1].arrive_(KT::WGMMA_THREAD_CNT);
   }
 
   async_proxy_fence();
@@ -231,17 +236,18 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
       for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
         for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
           for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-            tma_tracker.expect_bytes_and_arrive_(KT::BYTES_LOADED_PER_PHASE);
+            wgmma_tracker[phase_bit].wait_();
+
+            tma_tracker[phase_bit].expect_bytes_and_arrive_(KT::BYTES_LOADED_PER_PHASE);
             tma_into_shmem(
                 &a_map,
                 &b_map,
-                tma_tracker.as_raw_(),
+                tma_tracker[phase_bit].as_raw_(),
                 shmem_a[phase_bit],
                 shmem_b[phase_bit],
                 m_beg,
                 n_beg,
                 k_beg);
-            wgmma_tracker.wait_();
           }
         }
       }
@@ -259,11 +265,12 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
         memset(d, 0, sizeof(d));
 
         for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-          tma_tracker.wait_();
-          wgmma_tracker.arrive_();
+          tma_tracker[phase_bit].wait_();
 
           wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
           wgmma_wait<0>();
+
+          wgmma_tracker[phase_bit].arrive_();
         }
 
         write_back_to_c<KT>(M, N, m_beg, n_beg, C, warp_group, warp_idx, lane_idx, d);
