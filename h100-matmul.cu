@@ -170,8 +170,8 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
   int warp_idx = raw_warp_idx % 4;
   int warp_group = raw_warp_idx / 4;
 
-  bool is_wgmma = warp_group < KT::WGMMA_WARP_GROUP_CNT;
-  bool is_tma = !is_wgmma;
+  bool is_tma = warp_group < KT::TMA_WARP_GROUP_CNT;
+  bool first_thread_in_role = is_tma ? threadIdx.x == 0 : threadIdx.x == KT::TMA_THREAD_CNT;
 
   alignas(128) extern __shared__ bf16 shmem[];
 
@@ -187,26 +187,21 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
 
   if (threadIdx.x == 0) {
     init_barrier(&tma_tracker, 1);
-    expect_bytes_and_arrive(&tma_tracker, KT::BYTES_LOADED_PER_PHASE);
-
-    init_barrier(&wgmma_tracker, KT::WGMMA_WARP_GROUP_CNT);
+    init_barrier(&wgmma_tracker, KT::WGMMA_THREAD_CNT);
   }
 
   async_proxy_fence();
   __syncthreads();
 
-  float d[KT::CALCS_PER_WARPGROUP][16][8];
+  if (is_tma) {
 
-  int phase_bit = 0;
-
-  if (is_tma) {;
-
+    int phase_bit = 0;
     for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
       for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
         for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
 
-          wait(&wgmma_tracker, phase_bit);
-          if (threadIdx.x == KT::WGMMA_THREAD_CNT) {
+          if (first_thread_in_role) {
+            expect_bytes_and_arrive(&tma_tracker, KT::BYTES_LOADED_PER_PHASE);
             tma_into_shmem(
                 &a_map,
                 &b_map,
@@ -217,28 +212,26 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
                 n_beg,
                 k_beg);
           }
+          wait(&wgmma_tracker, phase_bit);
         }
       }
     }
 
   } else {
+    --warp_group;
 
+    int phase_bit = 0;
     for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
       for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
+        float d[KT::CALCS_PER_WARPGROUP][16][8];
         memset(d, 0, sizeof(d));
 
         for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-
-          if (warp_idx == 0 && lane_idx == 0) {
-            arrive(&wgmma_tracker, 1);
-          }
-
           wait(&tma_tracker, phase_bit);
-          if (threadIdx.x == 0) {
-            expect_bytes_and_arrive(&tma_tracker, KT::BYTES_LOADED_PER_PHASE);
-          }
 
           wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
+          wgmma_wait<1>();
+          arrive(&wgmma_tracker, 1);
           wgmma_wait<0>();
         }
 
