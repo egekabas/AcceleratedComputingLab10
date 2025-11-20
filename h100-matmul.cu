@@ -75,8 +75,8 @@ struct KernelTraits {
       (PHASE_M * PHASE_K + PHASE_K * PHASE_N) * sizeof(bf16);
   static constexpr int SHMEM_NEEDED = PHASE_CNT * BYTES_LOADED_PER_PHASE;
 
-  static constexpr int BLOCK_CNT_M = 16;
-  static constexpr int BLOCK_CNT_N = 8;
+  static constexpr int BLOCK_CNT_M = 8;
+  static constexpr int BLOCK_CNT_N = 16;
 };
 
 __always_inline __device__ void tma_into_shmem(
@@ -85,12 +85,12 @@ __always_inline __device__ void tma_into_shmem(
     uint64_t *barrier,
     bf16 *shmem_a,
     bf16 *shmem_b,
-    int m_beg,
-    int n_beg,
-    int k_beg) {
+    int m,
+    int n,
+    int k) {
 
-  cp_async_bulk_tensor_2d_global_to_shared(shmem_a, a_map, k_beg, m_beg, barrier);
-  cp_async_bulk_tensor_2d_global_to_shared(shmem_b, b_map, k_beg, n_beg, barrier);
+  cp_async_bulk_tensor_2d_global_to_shared(shmem_a, a_map, k, m, barrier);
+  cp_async_bulk_tensor_2d_global_to_shared(shmem_b, b_map, k, n, barrier);
 }
 
 template <typename KT>
@@ -156,20 +156,22 @@ class BarrierWrapper {
   int phase_bit;
 
 public:
-  __device__ BarrierWrapper(uint64_t *barrier) : barrier(barrier), phase_bit(0) {}
+  __device__ __always_inline BarrierWrapper(uint64_t *barrier) : barrier(barrier), phase_bit(0) {}
 
-  __device__ void init_(int arrival_count) { init_barrier(barrier, arrival_count); }
+  __device__ __always_inline void init_(int arrival_count) { init_barrier(barrier, arrival_count); }
 
-  __device__ void arrive_(int count = 1) { arrive(barrier, count); }
+  __device__ __always_inline void arrive_(int count = 1) { arrive(barrier, count); }
 
-  __device__ void wait_() {
+  __device__ __always_inline void wait_() {
     wait(barrier, phase_bit);
     phase_bit ^= 1;
   }
 
-  __device__ void expect_bytes_and_arrive_(int bytes) { expect_bytes_and_arrive(barrier, bytes); }
+  __device__ __always_inline void expect_bytes_and_arrive_(int bytes) {
+    expect_bytes_and_arrive(barrier, bytes);
+  }
 
-  __device__ uint64_t *as_raw_() { return barrier; }
+  __device__ __always_inline uint64_t *as_raw_() { return barrier; }
 };
 
 template <typename KT>
@@ -181,17 +183,12 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap b_map,
     bf16 *C) {
 
-  int BLOCK_M = ceil_div(M, KT::BLOCK_CNT_M);
-  if (BLOCK_M % KT::PHASE_M) {
-    BLOCK_M += KT::PHASE_M - BLOCK_M % KT::PHASE_M;
-  }
-  int BLOCK_N = ceil_div(N, KT::BLOCK_CNT_N);
-  if (BLOCK_N % KT::PHASE_N) {
-    BLOCK_N += KT::PHASE_N - BLOCK_N % KT::PHASE_N;
-  }
+  int block_idx_m = blockIdx.x % KT::BLOCK_CNT_M;
+  int block_idx_n = blockIdx.x / KT::BLOCK_CNT_M;
 
-  int block_m = blockIdx.x % KT::BLOCK_CNT_M;
-  int block_n = blockIdx.x / KT::BLOCK_CNT_M;
+#define BLOCK_LOOP \
+  for (int m = block_idx_m * KT::PHASE_M; m < M; m += KT::BLOCK_CNT_M * KT::PHASE_M) \
+    for (int n = block_idx_n * KT::PHASE_N; n < N; n += KT::BLOCK_CNT_N * KT::PHASE_N)
 
   int lane_idx = threadIdx.x % 32;
   int raw_warp_idx = threadIdx.x / 32;
@@ -214,8 +211,12 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
   __shared__ alignas(8) uint64_t tma_tracker_raw[2];
   __shared__ alignas(8) uint64_t wgmma_tracker_raw[2];
 
-  BarrierWrapper tma_tracker[2] = {BarrierWrapper{&tma_tracker_raw[0]}, BarrierWrapper{&tma_tracker_raw[1]}};
-  BarrierWrapper wgmma_tracker[2] = {BarrierWrapper{&wgmma_tracker_raw[0]}, BarrierWrapper{&wgmma_tracker_raw[1]}};
+  BarrierWrapper tma_tracker[2] = {
+      BarrierWrapper{&tma_tracker_raw[0]},
+      BarrierWrapper{&tma_tracker_raw[1]}};
+  BarrierWrapper wgmma_tracker[2] = {
+      BarrierWrapper{&wgmma_tracker_raw[0]},
+      BarrierWrapper{&wgmma_tracker_raw[1]}};
 
   if (threadIdx.x == 0) {
     tma_tracker[0].init_(1);
@@ -234,22 +235,20 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
     warpgroup_reg_dealloc<24>();
     if (first_thread_in_role) {
       int phase_bit = 0;
-      for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
-        for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
-          for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-            wgmma_tracker[phase_bit].wait_();
+      BLOCK_LOOP {
+        for (int k = 0; k < K; k += KT::PHASE_K, phase_bit ^= 1) {
+          wgmma_tracker[phase_bit].wait_();
 
-            tma_tracker[phase_bit].expect_bytes_and_arrive_(KT::BYTES_LOADED_PER_PHASE);
-            tma_into_shmem(
-                &a_map,
-                &b_map,
-                tma_tracker[phase_bit].as_raw_(),
-                shmem_a[phase_bit],
-                shmem_b[phase_bit],
-                m_beg,
-                n_beg,
-                k_beg);
-          }
+          tma_tracker[phase_bit].expect_bytes_and_arrive_(KT::BYTES_LOADED_PER_PHASE);
+          tma_into_shmem(
+              &a_map,
+              &b_map,
+              tma_tracker[phase_bit].as_raw_(),
+              shmem_a[phase_bit],
+              shmem_b[phase_bit],
+              m,
+              n,
+              k);
         }
       }
     }
@@ -261,25 +260,25 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
     --warp_group;
 
     int phase_bit = 0;
-    for (int m_beg = block_m * BLOCK_M; m_beg < (block_m + 1) * BLOCK_M; m_beg += KT::PHASE_M) {
-      for (int n_beg = block_n * BLOCK_N; n_beg < (block_n + 1) * BLOCK_N; n_beg += KT::PHASE_N) {
-        memset(d, 0, sizeof(d));
+    BLOCK_LOOP {
+      memset(d, 0, sizeof(d));
 
-        for (int k_beg = 0; k_beg < K; k_beg += KT::PHASE_K, phase_bit ^= 1) {
-          tma_tracker[phase_bit].wait_();
+      for (int k = 0; k < K; k += KT::PHASE_K, phase_bit ^= 1) {
+        tma_tracker[phase_bit].wait_();
 
-          wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
-          wgmma_wait<0>();
+        wgmma<KT>(warp_group, shmem_a[phase_bit], shmem_b[phase_bit], d);
+        wgmma_wait<0>();
 
-          if (first_in_warpgroup) {
-            wgmma_tracker[phase_bit].arrive_();
-          }
+        if (first_in_warpgroup) {
+          wgmma_tracker[phase_bit].arrive_();
         }
-
-        write_back_to_c<KT>(M, N, m_beg, n_beg, C, warp_group, warp_idx, lane_idx, d);
       }
+
+      write_back_to_c<KT>(M, N, m, n, C, warp_group, warp_idx, lane_idx, d);
     }
   }
+
+#undef BLOCK_LOOP
 }
 
 CUtensorMap create_tensor_map(
