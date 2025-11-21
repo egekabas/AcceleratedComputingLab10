@@ -158,32 +158,55 @@ __always_inline __device__ void write_back_to_c(
   }
 }
 
-class BarrierWrapper {
-  uint64_t *barrier;
-  int phase_bit;
+template <typename KT> class BarrierWrapper {
+private:
+  uint64_t *tma_trackers;
+  uint64_t *wgmma_trackers;
+
+  int phase_idx = 0;
+  int phase_parity = 0;
 
 public:
-  __device__ __always_inline BarrierWrapper() = default;
-  __device__ __always_inline BarrierWrapper(uint64_t *barrier) : barrier(barrier), phase_bit(0) {}
+  __always_inline __device__ BarrierWrapper(uint64_t *tma_trackers, uint64_t *wgmma_trackers)
+      : tma_trackers(tma_trackers), wgmma_trackers(wgmma_trackers) {}
 
-  __device__ __always_inline void init_(int arrival_count) { init_barrier(barrier, arrival_count); }
+  __always_inline __device__ void init() {
+    UNROLLED_FOR(int phase_idx = 0; phase_idx < KT::PHASE_CNT; ++phase_idx) {
+      init_barrier(&tma_trackers[phase_idx], 1);
 
-  __device__ __always_inline void arrive_(int count = 1) { arrive(barrier, count); }
-
-  __device__ __always_inline void wait_() {
-    wait(barrier, phase_bit);
-    phase_bit ^= 1;
+      init_barrier(&wgmma_trackers[phase_idx], KT::WGMMA_WARP_GROUP_CNT);
+      arrive(&wgmma_trackers[phase_idx], KT::WGMMA_WARP_GROUP_CNT);
+    }
   }
 
-  __device__ __always_inline void expect_bytes_and_arrive_(int bytes) {
-    expect_bytes_and_arrive(barrier, bytes);
+  __always_inline __device__ void advance_phase() {
+    phase_idx++;
+    if (phase_idx == KT::PHASE_CNT) {
+      phase_idx = 0;
+      phase_parity ^= 1;
+    }
   }
 
-  __device__ __always_inline uint64_t *as_raw_() { return barrier; }
+  __always_inline __device__ void wait_wgmma() { wait(&wgmma_trackers[phase_idx], phase_parity); }
+  __always_inline __device__ void arrive_wgmma() { arrive(&wgmma_trackers[phase_idx], 1); }
+
+  __always_inline __device__ void wait_tma() { wait(&tma_trackers[phase_idx], phase_parity); }
+  __always_inline __device__ void expect_bytes_and_arrive_tma() {
+    expect_bytes_and_arrive(&tma_trackers[phase_idx], KT::BYTES_LOADED_PER_PHASE);
+  }
+  __always_inline __device__ uint64_t *get_tma() { return &tma_trackers[phase_idx]; }
+  __always_inline __device__ int get_phase_idx() { return phase_idx; }
 };
 
-__device__ __host__ __always_inline int next_modulo(int val, int mod) {
-  return val == mod - 1 ? 0 : val + 1;
+template <typename KT>
+__always_inline __device__ void
+init_shmem_arrays(bf16 *shmem, bf16 *shmem_a[KT::PHASE_CNT], bf16 *shmem_b[KT::PHASE_CNT]) {
+  shmem_a[0] = shmem;
+  shmem_b[0] = shmem_a[0] + KT::PHASE_M * KT::PHASE_K;
+  UNROLLED_FOR(int phase_idx = 1; phase_idx < KT::PHASE_CNT; ++phase_idx) {
+    shmem_a[phase_idx] = shmem_b[phase_idx - 1] + KT::PHASE_N * KT::PHASE_K;
+    shmem_b[phase_idx] = shmem_a[phase_idx] + KT::PHASE_M * KT::PHASE_K;
+  }
 }
 
 template <typename KT>
@@ -212,54 +235,33 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
   bool first_in_warpgroup = warp_idx == 0 && lane_idx == 0;
 
   alignas(128) extern __shared__ bf16 shmem[];
-
-  bf16 *shmem_a[2], *shmem_b[2];
-
-  shmem_a[0] = shmem;
-  shmem_b[0] = shmem_a[0] + KT::PHASE_M * KT::PHASE_K;
-  shmem_a[1] = shmem_b[0] + KT::PHASE_N * KT::PHASE_K;
-  shmem_b[1] = shmem_a[1] + KT::PHASE_M * KT::PHASE_K;
+  bf16 *shmem_a[KT::PHASE_CNT], *shmem_b[KT::PHASE_CNT];
+  init_shmem_arrays<KT>(shmem, shmem_a, shmem_b);
 
   __shared__ alignas(8) uint64_t tma_tracker_raw[KT::PHASE_CNT];
   __shared__ alignas(8) uint64_t wgmma_tracker_raw[KT::PHASE_CNT];
 
-  BarrierWrapper tma_tracker[KT::PHASE_CNT];
-  BarrierWrapper wgmma_tracker[KT::PHASE_CNT];
-
-  UNROLLED_FOR(int phase_idx = 0; phase_idx < KT::PHASE_CNT; ++phase_idx) {
-    tma_tracker[phase_idx] = BarrierWrapper{&tma_tracker_raw[phase_idx]};
-    wgmma_tracker[phase_idx] = BarrierWrapper{&wgmma_tracker_raw[phase_idx]};
-  }
-
+  BarrierWrapper<KT> barrier_wrapper{tma_tracker_raw, wgmma_tracker_raw};
   if (threadIdx.x == 0) {
-
-    UNROLLED_FOR(int phase_idx = 0; phase_idx < KT::PHASE_CNT; ++phase_idx) {
-      tma_tracker[phase_idx].init_(1);
-
-      wgmma_tracker[phase_idx].init_(KT::WGMMA_WARP_GROUP_CNT);
-      wgmma_tracker[phase_idx].arrive_(KT::WGMMA_WARP_GROUP_CNT);
-    }
+    barrier_wrapper.init();
   }
-
   async_proxy_fence();
   __syncthreads();
 
   if (is_tma) {
     warpgroup_reg_dealloc<24>();
-    if (first_thread_in_role) {
-      int phase_idx = 0;
-      BLOCK_LOOP {
-        for (int k = 0; k < K;
-             k += KT::PHASE_K, phase_idx = next_modulo(phase_idx, KT::PHASE_CNT)) {
-          wgmma_tracker[phase_idx].wait_();
 
-          tma_tracker[phase_idx].expect_bytes_and_arrive_(KT::BYTES_LOADED_PER_PHASE);
+    if (first_thread_in_role) {
+      BLOCK_LOOP {
+        for (int k = 0; k < K; k += KT::PHASE_K, barrier_wrapper.advance_phase()) {
+          barrier_wrapper.wait_wgmma();
+          barrier_wrapper.expect_bytes_and_arrive_tma();
           tma_into_shmem(
               &a_map,
               &b_map,
-              tma_tracker[phase_idx].as_raw_(),
-              shmem_a[phase_idx],
-              shmem_b[phase_idx],
+              barrier_wrapper.get_tma(),
+              shmem_a[barrier_wrapper.get_phase_idx()],
+              shmem_b[barrier_wrapper.get_phase_idx()],
               m,
               n,
               k);
@@ -267,22 +269,23 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
       }
     }
   } else {
-
     warpgroup_reg_alloc<240>();
 
     float d[KT::CALCS_PER_WARPGROUP][16][8];
     --warp_group;
 
-    int phase_idx = 0;
     BLOCK_LOOP {
-      for (int k = 0; k < K; k += KT::PHASE_K, phase_idx = next_modulo(phase_idx, KT::PHASE_CNT)) {
-        tma_tracker[phase_idx].wait_();
-
-        wgmma<KT>(warp_group, shmem_a[phase_idx], shmem_b[phase_idx], d, k == 0);
+      for (int k = 0; k < K; k += KT::PHASE_K, barrier_wrapper.advance_phase()) {
+        barrier_wrapper.wait_tma();
+        wgmma<KT>(
+            warp_group,
+            shmem_a[barrier_wrapper.get_phase_idx()],
+            shmem_b[barrier_wrapper.get_phase_idx()],
+            d,
+            k == 0);
         wgmma_wait<0>();
-
         if (first_in_warpgroup) {
-          wgmma_tracker[phase_idx].arrive_();
+          barrier_wrapper.arrive_wgmma();
         }
       }
 
