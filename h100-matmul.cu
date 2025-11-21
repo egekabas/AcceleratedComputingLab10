@@ -80,6 +80,7 @@ struct KernelTraits {
   static constexpr int WGMMA_REG_CNT = 240;
 };
 
+template <typename KT>
 __always_inline __device__ void tma_into_shmem(
     const CUtensorMap *a_map,
     const CUtensorMap *b_map,
@@ -90,35 +91,26 @@ __always_inline __device__ void tma_into_shmem(
     int n,
     int k) {
 
-  cp_async_bulk_tensor_2d_global_to_shared(shmem_a, a_map, k, m, barrier);
-  cp_async_bulk_tensor_2d_global_to_shared(shmem_b, b_map, k, n, barrier);
+  cp_async_bulk_tensor_3d_global_to_shared(shmem_a, a_map, 0, m, k / KT::CORE_MATRIX_COLS, barrier);
+  cp_async_bulk_tensor_3d_global_to_shared(shmem_b, b_map, 0, n, k / KT::CORE_MATRIX_COLS, barrier);
 }
 
 template <typename KT>
-__always_inline __device__ void wgmma(
-    int warp_group,
-    bf16 *shmem_a,
-    bf16 *shmem_b,
-    float d[16][8],
-    bool first_matmul) {
+__always_inline __device__ void
+wgmma(int warp_group, bf16 *shmem_a, bf16 *shmem_b, float d[16][8]) {
 
   warpgroup_arrive();
   UNROLLED_FOR(int k_idx = 0; k_idx < KT::PHASE_K / KT::WGMMA_K; ++k_idx) {
 
     int stride_byte_offset = KT::PHASE_K * KT::CORE_MATRIX_ROWS * sizeof(bf16);
 
-    bf16 *cur_shmem_a = shmem_a + warp_group * KT::WGMMA_M * KT::PHASE_K +
-        k_idx * KT::WGMMA_K;
+    bf16 *cur_shmem_a = shmem_a + warp_group * KT::WGMMA_M * KT::PHASE_K + k_idx * KT::WGMMA_K;
     bf16 *cur_shmem_b = shmem_b + k_idx * KT::WGMMA_K;
 
     uint64_t a_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_a, 1, stride_byte_offset);
     uint64_t b_des = make_smem_desc<KT::SWIZZLE_TYPE>(cur_shmem_b, 1, stride_byte_offset);
 
-    if (first_matmul && k_idx == 0) {
-      wgmma_n256<0, 1, 1, 0, 0>(a_des, b_des, d);
-    } else {
-      wgmma_n256<1, 1, 1, 0, 0>(a_des, b_des, d);
-    }
+    wgmma_n256<1, 1, 1, 0, 0>(a_des, b_des, d);
   }
 
   wgmma_commit();
@@ -142,8 +134,7 @@ __always_inline __device__ void write_back_to_c(
 
         int idx = k + j * 2 + i * 2 * 2;
 
-        int m = (m_beg + warp_group * KT::WGMMA_M) +
-            16 * warp_idx + lane_idx / 4 + j * 8;
+        int m = (m_beg + warp_group * KT::WGMMA_M) + 16 * warp_idx + lane_idx / 4 + j * 8;
         int n = (n_beg) + (lane_idx % 4) * 2 + 8 * i + k;
 
         if (n < N && m < M) {
@@ -152,7 +143,6 @@ __always_inline __device__ void write_back_to_c(
       }
     }
   }
-
 }
 
 template <typename KT> class BarrierWrapper {
@@ -253,7 +243,7 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
         for (int k = 0; k < K; k += KT::PHASE_K, barrier_wrapper.advance_phase()) {
           barrier_wrapper.wait_wgmma();
           barrier_wrapper.expect_bytes_and_arrive_tma();
-          tma_into_shmem(
+          tma_into_shmem<KT>(
               &a_map,
               &b_map,
               barrier_wrapper.get_tma(),
@@ -272,14 +262,14 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
     --warp_group;
 
     BLOCK_LOOP {
+      memset(d, 0, sizeof(d));
       for (int k = 0; k < K; k += KT::PHASE_K, barrier_wrapper.advance_phase()) {
         barrier_wrapper.wait_tma();
         wgmma<KT>(
             warp_group,
             shmem_a[barrier_wrapper.get_phase_idx()],
             shmem_b[barrier_wrapper.get_phase_idx()],
-            d,
-            k == 0);
+            d);
         wgmma_wait<0>();
         if (is_first_in_warpgroup) {
           barrier_wrapper.arrive_wgmma();
@@ -293,7 +283,7 @@ __launch_bounds__(KT::TOTAL_THREAD_CNT) __global__ void h100_matmul(
 #undef BLOCK_LOOP
 }
 
-CUtensorMap create_tensor_map(
+CUtensorMap create_tensor_map2d(
     bf16 *array,
     uint64_t global_cols,
     uint64_t global_rows,
@@ -323,12 +313,60 @@ CUtensorMap create_tensor_map(
   return map;
 }
 
+CUtensorMap create_tensor_map3d(
+    bf16 *array,
+    uint64_t global_cols,
+    uint64_t global_rows,
+    uint32_t box_cols,
+    uint32_t box_rows,
+    wgmmaSwizzle swizzle_type,
+    uint64_t core_matrix_cols) {
+  CUtensorMap map;
+  const uint64_t globalDim[] = {core_matrix_cols, global_rows, global_cols / core_matrix_cols};
+  const uint64_t globalStrides[] = {global_cols * sizeof(bf16), core_matrix_cols * sizeof(bf16)};
+  const uint32_t boxDim[] = {
+      static_cast<uint32_t>(core_matrix_cols),
+      box_rows,
+      box_cols / static_cast<uint32_t>(core_matrix_cols)};
+  const uint32_t elementStrides[] = {1, 1, 1};
+
+  CUDA_CHECK(cuTensorMapEncodeTiled(
+      &map,
+      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+      3,
+      array,
+      globalDim,
+      globalStrides,
+      boxDim,
+      elementStrides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      convert_swizzle_enums(swizzle_type),
+      CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+  return map;
+}
+
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
   using KT = KernelTraits;
 
-  CUtensorMap a_map = create_tensor_map(A, K, M, KT::PHASE_K, KT::PHASE_M, KT::SWIZZLE_TYPE);
-  CUtensorMap b_map = create_tensor_map(B, K, N, KT::PHASE_K, KT::PHASE_N, KT::SWIZZLE_TYPE);
+  CUtensorMap a_map = create_tensor_map3d(
+      A,
+      K,
+      M,
+      KT::PHASE_K,
+      KT::PHASE_M,
+      KT::SWIZZLE_TYPE,
+      KT::CORE_MATRIX_COLS);
+  CUtensorMap b_map = create_tensor_map3d(
+      B,
+      K,
+      N,
+      KT::PHASE_K,
+      KT::PHASE_N,
+      KT::SWIZZLE_TYPE,
+      KT::CORE_MATRIX_COLS);
 
   cudaFuncSetAttribute(
       h100_matmul<KT>,
